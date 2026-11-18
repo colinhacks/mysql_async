@@ -1,0 +1,103 @@
+# Verification for the named-pipe branch, run on the fork only (never part of the upstream PR).
+name: named-pipes
+
+on:
+  push:
+    branches: [ci-named-pipes]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        # the branch under test, and upstream master as the baseline for the whole suite
+        ref: [branch, master]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        if: matrix.ref == 'branch'
+      - uses: actions/checkout@v4
+        if: matrix.ref == 'master'
+        with:
+          repository: blackbeam/mysql_async
+          ref: master
+      - name: Start MySQL with named pipes on
+        shell: pwsh
+        run: |
+          $bin = (Get-ChildItem "C:\Program Files\MySQL\*\bin\mysqld.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).DirectoryName
+          if (-not $bin) { throw "no MySQL server on this runner" }
+          & "$bin\mysqld.exe" --version
+          $data = "$env:RUNNER_TEMP\mysql".Replace("\", "/")
+          $ini = "$env:RUNNER_TEMP\my.ini"
+          # the image's defaults otherwise: no named_pipe_full_access_group
+          Set-Content $ini "[mysqld]`ndatadir=$data`nport=3306`nbind-address=127.0.0.1`nmysqlx=OFF`nnamed-pipe=ON`nsocket=MySQL`nmax_allowed_packet=36700160`nenforce_gtid_consistency=ON`ngtid_mode=ON`nlocal_infile=ON`nlog-error=$data.log"
+          & "$bin\mysqld.exe" "--defaults-file=$ini" --initialize-insecure
+          & "$bin\mysqld.exe" --install MySQLTest "--defaults-file=$ini"
+          Start-Service MySQLTest
+          for ($i = 0; $i -lt 60; $i++) { & "$bin\mysqladmin.exe" --user=root --host=127.0.0.1 --port=3306 ping 2>$null; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep 1 }
+          & "$bin\mysql.exe" --user=root --host=127.0.0.1 --port=3306 -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'password'; CREATE USER 'root'@'%' IDENTIFIED BY 'password'; GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;"
+          & "$bin\mysql.exe" --user=root --password=password --protocol=PIPE --socket=MySQL --get-server-public-key -e "SELECT VERSION(), @@named_pipe, @@socket, @@named_pipe_full_access_group, CURRENT_USER()"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.ref }}
+      - name: The named-pipe test, strict
+        if: matrix.ref == 'branch'
+        shell: bash
+        env:
+          DATABASE_URL: mysql://root:password@127.0.0.1:3306/mysql
+          RUST_BACKTRACE: 1
+        run: |
+          set -o pipefail
+          cargo test --lib should_connect_via_socket -- --nocapture 2>&1 | tee pipe.log
+          ! grep -q "Skipping: socket" pipe.log
+      - name: The named-pipe test over a URL
+        if: matrix.ref == 'branch'
+        shell: bash
+        env:
+          DATABASE_URL: mysql://root:password@localhost/mysql?socket=MySQL&prefer_socket=false
+        run: cargo test --lib should_connect -- --nocapture
+      - name: The named-pipe test with rustls, TLS requested over TCP
+        if: matrix.ref == 'branch'
+        shell: bash
+        env:
+          DATABASE_URL: mysql://root:password@127.0.0.1:3306/mysql
+          SSL: "true"
+        run: cargo test --lib --no-default-features --features default-rustls should_connect_via_socket -- --nocapture
+      - name: The whole suite
+        continue-on-error: true
+        shell: bash
+        env:
+          DATABASE_URL: mysql://root:password@127.0.0.1:3306/mysql
+          RUST_BACKTRACE: 1
+        run: cargo test --lib 2>&1 | tail -80
+      - if: always()
+        shell: bash
+        run: cat "$RUNNER_TEMP/mysql.log" | tail -40 || true
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start MySQL
+        run: |
+          sudo systemctl start mysql
+          mysql -uroot -proot -e "SET GLOBAL max_allowed_packet = 36700160; SELECT VERSION(), @@socket"
+          ls -la /var/run/mysqld/
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt -- --check
+      - name: The socket test, strict
+        env:
+          DATABASE_URL: mysql://root:root@127.0.0.1:3306/mysql
+        run: |
+          set -o pipefail
+          cargo test --lib should_connect_via_socket -- --nocapture 2>&1 | tee sock.log
+          ! grep -q "Skipping: socket" sock.log
+      - name: The suite, as azure-pipelines.yml runs it first
+        env:
+          DATABASE_URL: mysql://root:root@127.0.0.1:3306/mysql
+          RUST_BACKTRACE: 1
+        run: |
+          SSL=false COMPRESS=false cargo test --lib
+          SSL=true COMPRESS=false cargo test --lib --features native-tls-tls
