@@ -1,0 +1,114 @@
+# Verification for the TLS-over-socket branch, run on the fork only (never part of the upstream PR).
+name: tls-over-socket
+
+on:
+  push:
+    branches: [ci-tls-over-socket]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [native-tls-tls, "rustls-tls ring"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Start MySQL
+        run: |
+          sudo systemctl start mysql
+          mysql -uroot -proot -e "SET GLOBAL max_allowed_packet = 36700160; SELECT VERSION(), @@socket"
+          mysql -uroot -proot -S /var/run/mysqld/mysqld.sock --ssl-mode=REQUIRED -e "SHOW SESSION STATUS LIKE 'Ssl_cipher'"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - name: Before the fix, TLS over the socket fails
+        env:
+          DATABASE_URL: mysql://root:root@127.0.0.1:3306/mysql
+          SSL: "true"
+        run: |
+          set -o pipefail
+          git checkout HEAD~2 -- src/io
+          ! cargo test --lib --features "${{ matrix.features }}" should_connect_via_socket_with_tls -- --nocapture 2>&1 | tee before.log
+          grep -i "out of sync\|error" before.log | head -5
+          git checkout HEAD -- src/io
+      - name: The TLS-over-socket test, strict
+        env:
+          DATABASE_URL: mysql://root:root@127.0.0.1:3306/mysql
+          SSL: "true"
+        run: |
+          set -o pipefail
+          cargo test --lib --features "${{ matrix.features }}" should_connect_via_socket -- --nocapture 2>&1 | tee sock.log
+          ! grep -q "Skipping: socket" sock.log
+      - name: The suite with TLS, and with TLS and the socket preferred
+        env:
+          DATABASE_URL: mysql://root:root@127.0.0.1:3306/mysql
+          RUST_BACKTRACE: 1
+        run: |
+          SSL=true cargo test --lib --features "${{ matrix.features }}"
+          SSL=false cargo test --lib
+      - name: Format
+        if: matrix.features == 'native-tls-tls'
+        run: cargo fmt -- --check
+
+  mariadb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start MariaDB 11 with its socket on the host
+        run: |
+          sudo mkdir -p /run/mysqld && sudo chmod 777 /run/mysqld
+          docker run -d --name mariadb -p 3307:3306 -v /run/mysqld:/run/mysqld -e MARIADB_ROOT_PASSWORD=password mariadb:11 --ssl --max-allowed-packet=36700160
+          for i in $(seq 1 60); do docker exec mariadb mariadb -uroot -ppassword -e "SELECT 1" >/dev/null 2>&1 && break; sleep 1; done
+          docker exec mariadb mariadb -uroot -ppassword -e "SELECT VERSION(), @@socket, @@have_ssl"
+          sudo chmod 777 /run/mysqld/mysqld.sock || true
+          ls -la /run/mysqld
+      - uses: Swatinem/rust-cache@v2
+      - name: The TLS-over-socket test, strict
+        env:
+          DATABASE_URL: mysql://root:password@127.0.0.1:3307/mysql
+          SSL: "true"
+        run: |
+          set -o pipefail
+          cargo test --lib --features native-tls-tls should_connect_via_socket -- --nocapture 2>&1 | tee sock.log
+          ! grep -q "Skipping: socket" sock.log
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [native-tls-tls, "rustls-tls ring"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start MySQL with named pipes on
+        shell: pwsh
+        run: |
+          $bin = (Get-ChildItem "C:\Program Files\MySQL\*\bin\mysqld.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).DirectoryName
+          $data = "$env:RUNNER_TEMP\mysql".Replace("\", "/")
+          $ini = "$env:RUNNER_TEMP\my.ini"
+          Set-Content $ini "[mysqld]`ndatadir=$data`nport=3306`nbind-address=127.0.0.1`nmysqlx=OFF`nnamed-pipe=ON`nsocket=MySQL`nmax_allowed_packet=36700160`nlocal_infile=ON`nlog-error=$data.log"
+          & "$bin\mysqld.exe" "--defaults-file=$ini" --initialize-insecure
+          & "$bin\mysqld.exe" --install MySQLTest "--defaults-file=$ini"
+          Start-Service MySQLTest
+          for ($i = 0; $i -lt 60; $i++) { & "$bin\mysqladmin.exe" --user=root --host=127.0.0.1 --port=3306 ping 2>$null; if ($LASTEXITCODE -eq 0) { break }; Start-Sleep 1 }
+          & "$bin\mysql.exe" --user=root --host=127.0.0.1 --port=3306 -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'password'; CREATE USER 'root'@'%' IDENTIFIED BY 'password'; GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;"
+          & "$bin\mysql.exe" --user=root --password=password --protocol=PIPE --socket=MySQL --ssl-mode=REQUIRED -e "SHOW SESSION STATUS LIKE 'Ssl_cipher'"
+          "mysql CLI TLS over the pipe exit: $LASTEXITCODE"
+          exit 0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+      - name: The TLS-over-pipe test
+        shell: bash
+        env:
+          DATABASE_URL: mysql://root:password@127.0.0.1:3306/mysql
+          SSL: "true"
+          RUST_BACKTRACE: 1
+        run: |
+          set -o pipefail
+          cargo test --lib --features "${{ matrix.features }}" should_connect_via_socket -- --nocapture 2>&1 | tee pipe.log
+          ! grep -q "Skipping: socket" pipe.log
